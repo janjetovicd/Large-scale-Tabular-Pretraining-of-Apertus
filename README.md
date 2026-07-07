@@ -2,9 +2,11 @@
 
 Serialization format ablation study for large-scale tabular pretraining. Part of a semester project at EPFL / CSCS.
 
-**Report:** [Tabular Datasets for Posttraining Pipeline of Apertus](https://github.com/janjetovicd/tabular_ablation/blob/main/Apertus_Semester_Project_Report.pdf)
+**Report:** [Tabular Datasets for the Posttraining Pipeline of Apertus](https://github.com/janjetovicd/tabular_ablation/blob/main/Semester_Project_Report_Dijana_Janjetovic_updated.pdf)
 
-**Goal:** Train 5 small proxy models (1.54B parameters, 48B tokens each) on the [T4 dataset](https://huggingface.co/datasets/mlfoundations/t4), one per serialization format, and evaluate which format leads to the best downstream tabular understanding — informing the format choice for full-scale Apertus pretraining.
+**Goal:** Train 5 small proxy models (1.54B parameters, ~30B tokens per run, 2 random seeds each) on the [T4 dataset](https://huggingface.co/datasets/mlfoundations/t4), one per serialization format, and evaluate which format leads to the best downstream tabular understanding — informing the format choice for the Apertus posttraining mixture (tabular data added on top of an already-trained Apertus).
+
+**Comparison method:** formats are compared at matched **rows seen**, not matched tokens — token-efficient formats (CSV, SQL schema) pack ~2x more rows into the same token budget, so a fixed-token comparison would confound serialization quality with data quantity. See [`analysis/RUNBOOK.md`](analysis/RUNBOOK.md) for the full method and script order.
 
 **Formats under test:** `csv`, `keyvalue`, `markdown`, `json`, `sql_schema`
 
@@ -130,34 +132,36 @@ Container definition for GPU training jobs. Specifies `ngc-nemo:25.11.01-alps3`.
 
 ## Evaluation
 
-Validation loss curves during training are tracked via WandB. For downstream evaluation, we use a **BLiMP-style log-probability scoring** approach on held-out T4 data (chunks 24–25, not seen during training).
+Training loss is tracked via WandB/TensorBoard but is **not** used to pick a format — verbose formats (JSON, key:value, Markdown) reach lower loss simply because their token streams are more predictable, not because the model understands tables better. Downstream evaluation uses a **BLiMP-style minimal-pair** protocol on held-out T4 data (chunks 24–25, not seen during training), run once per format per seed at the matched (rows-seen-equalized) checkpoint.
 
 **Methodology:**
-1. Sample 300 tables from the held-out chunks.
-2. For each table and each format, build a context prompt from rows 0..k-1 (fitting within the 3800-token budget), holding out the last row.
-3. Use LLaMA-3.1-8B to generate a *statement* (correct last-row completion) and a *distractor* (plausible but incorrect completion) for each table.
-4. At inference time, compute `log P(statement | table_context)` and `log P(distractor | table_context)` using each of the 5 proxy models.
-5. The model assigns higher probability to the correct statement → correct. Accuracy across 300 tables per format determines the winning serialization.
+1. Sample 299 held-out tables (≥2 rows, header fits the 3,800-token budget in all 5 formats).
+2. Truncate each table to the 3,800-token budget *before* generating any statements, so the cell needed to verify a statement can never be truncated away later.
+3. Prompt LLaMA-3.1-8B-Instruct on the truncated context to generate one correct statement + one plausible distractor per **task type** — lookup, aggregation, comparison, inference, multihop — yielding up to 1,496 minimal pairs per format (~5/table). The same statement pairs are reused across all 5 formats, so generation noise can't bias the ranking.
+4. Each proxy model scores both statements by mean NLL conditioned on the table context; the pair is correct if the true statement gets the higher likelihood (chance = 50%).
+5. Report **per-pair accuracy** (fraction of pairs correct) and **per-table accuracy** (all-correct / majority-correct per table), on the common ~1,484-pair set every format could serialize.
 
-This evaluates whether the model has learned tabular structure well enough to prefer factually correct completions over plausible distractors.
+A cross-format/cross-seed **consistency analysis** additionally checks whether the *same* tables are hard across formats and seeds (they are, r=0.41–0.61 cross-format) — evidence that near-chance accuracy reflects table/distractor difficulty rather than the model or the serialization format.
 
-### `Evaluation/prepare_eval_data.py`
+### `prepare_eval_data_v2.py`
 
-Prepares the evaluation dataset. Scans T4 chunks 24–25, filters valid tables (≥2 rows, header fits token budget across all 5 formats), and samples 300 tables with a fixed seed. For each table, builds context prompts in all 5 formats simultaneously and saves the held-out last row as ground truth.
+Prepares the evaluation dataset: scans T4 chunks 24–25, filters valid tables, samples 299 with a fixed seed, and for each table builds truncated context prompts + generates the statement/distractor pairs per task type across all 5 formats simultaneously. `prepare_eval_data_v2_cpu.py` is the CPU-only variant for the login node.
 
-**Output** (written to `/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/eval/`):
-- `prompts_{format}.jsonl` — one `{table_id, prompt}` per table per format
-- `ground_truth.jsonl` — `{table_id, ground_truth_dict, col_dtypes}` per table
-- `dataframes/{table_id}.pkl` — cleaned DataFrames for cross-format consistency checks
+### `run_eval_inference.py` / `submit_eval_inference.sh`
 
-**Usage** (login node, CPU only, ~10 min):
-```bash
-python Evaluation/prepare_eval_data.py
-```
+Runs inference-time NLL scoring of every statement/distractor pair against each proxy model checkpoint. Submitted per (format, seed) at the matched checkpoint from `analysis/build_eval_plan.py` / `analysis/03_fixed_table_checkpoints.py`.
 
-### `run_eval.sh`
+### `aggregate_eval_fair.py`
 
-SLURM job script that runs inference-time log-probability scoring on the prepared prompts. Requires 1 GPU, 12h wall time.
+Aggregates the two-seed, matched-checkpoint eval into per-pair and per-table (all-correct / majority) accuracy — this produces the final results table. Restricts every format to the common set of pairs present in all 5 formats (SQL schema fails to serialize 12/299 tables) so denominators match across formats.
+
+### `consistency_analysis.py` / `plot_consistency.py`
+
+Compute and plot the cross-format / cross-seed correlation of per-table accuracy (`consistency_heatmap.png`) — the check for whether accuracy is limited by table/distractor difficulty rather than by serialization format.
+
+### `analysis/` (fixed-table-size matching pipeline)
+
+Equalizes the 5 formats at the same number of **rows seen** rather than the same token budget before evaluation. Order: `01_assess_training.py` → `02_token_stats.py` → `03_fixed_table_checkpoints.py` (or `build_eval_plan.py` for checkpoints split across store/scratch) → `04_replot_loss_vs_rows.py` → `05_run_fixed_table_eval.sh`. `resume_unfinished.sh` resubmits any (format, seed) run that stalled short of the target step. Full walkthrough in [`analysis/RUNBOOK.md`](analysis/RUNBOOK.md).
 
 ---
 
