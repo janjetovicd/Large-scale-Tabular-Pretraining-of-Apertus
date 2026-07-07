@@ -97,20 +97,20 @@ python3 04_replot_loss_vs_rows.py --token-stats token_stats.json \
 
 # 5. Make sure eval pairs exist (held-out chunks 24–25), then submit eval
 #    at the matched checkpoints:
-python3 ../prepare_eval_data_v2.py        # only if pairs_<fmt>.jsonl not already on store
+python3 ../evaluation/prepare_eval_data_v2.py   # only if pairs_<fmt>.jsonl not already on store
 ./05_run_fixed_table_eval.sh              # mode=matched (fixed table size)
 ./05_run_fixed_table_eval.sh --mode final # optional: fixed-token baseline for contrast
 
-# 6. Aggregate accuracy (mean ± std across seeds) once eval jobs finish
-python3 ../aggregate_results.py \
-    --results-dir /capstor/store/cscs/swissai/a139/djanjetovic/tabular_ablation/eval_results
+# 6. Aggregate accuracy (per-pair + per-table, common set across formats) once eval jobs finish
+python3 ../evaluation/aggregate_eval_fair.py
 ```
 
 ## Reading the result
 
-- **`aggregate_results.py`** gives accuracy per format. The `_matched` run-ids are
-  the fair, fixed-table-size comparison; `_final` are the fixed-token baseline.
-  Compare the two to see how much the earlier ranking was a data-quantity artifact.
+- **`evaluation/aggregate_eval_fair.py`** gives per-pair and per-table (all-correct /
+  majority) accuracy per format, restricted to the common set of pairs every
+  format could serialize (`_matched` = fair, fixed-table-size comparison).
+  This is what produces the final results table in the report.
 - **Accuracy is the primary metric.** LM loss is *not* directly comparable across
   formats (different token distributions), so treat `loss_vs_rows.png` as a sanity
   check on training health and relative data exposure, not as the verdict.

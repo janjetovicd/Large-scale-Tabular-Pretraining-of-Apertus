@@ -10,7 +10,7 @@
 # Usage (login node):
 #   ./05_run_fixed_table_eval.sh                       # mode=matched (default)
 #   ./05_run_fixed_table_eval.sh --mode final          # eval at final checkpoints
-#   ./05_run_fixed_table_eval.sh --plan eval_plan.json --submit-script ../submit_eval_inference.sh
+#   ./05_run_fixed_table_eval.sh --plan eval_plan.json --submit-script ../evaluation/submit_eval_inference.sh
 #
 # Prerequisite: eval pairs must already exist at $STORE_DIR/eval/pairs_<fmt>.jsonl
 # (produced by prepare_eval_data_v2.py — see RUNBOOK.md).
@@ -18,7 +18,7 @@
 set -euo pipefail
 
 PLAN="eval_plan.json"
-SUBMIT_SCRIPT="../submit_eval_inference.sh"
+SUBMIT_SCRIPT="../evaluation/submit_eval_inference.sh"
 MODE="matched"          # matched | final
 
 while [[ $# -gt 0 ]]; do
@@ -67,5 +67,4 @@ done
 echo
 echo "All eval jobs submitted. Watch with: squeue --me"
 echo "When done, aggregate with:"
-echo "  python3 ../aggregate_results.py --results-dir \\"
-echo "    /capstor/store/cscs/swissai/a139/djanjetovic/tabular_ablation/eval_results"
+echo "  python3 ../evaluation/aggregate_eval_fair.py"
