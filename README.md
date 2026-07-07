@@ -155,9 +155,9 @@ Training loss is tracked via WandB/TensorBoard but is **not** used to pick a for
 
 A cross-format/cross-seed **consistency analysis** additionally checks whether the *same* tables are hard across formats and seeds (they are, r=0.41–0.61 cross-format) — evidence that near-chance accuracy reflects table/distractor difficulty rather than the model or the serialization format.
 
-### `prepare_eval_data_v2.py` / `prepare_eval_data_v2_cpu.py`
+### `prepare_eval_data_v2.py`
 
-Prepares the evaluation dataset: scans T4 chunks 24–25, filters valid tables, samples 299 with a fixed seed, and for each table builds truncated context prompts + generates the statement/distractor pairs per task type across all 5 formats simultaneously. Needs a GPU (LLaMA-3.1-8B-Instruct generation), submitted via `run_eval.sh`; `prepare_eval_data_v2_cpu.py` is the CPU-only variant for the login node.
+Prepares the evaluation dataset: scans T4 chunks 24–25, filters valid tables, samples 299 with a fixed seed, and for each table builds truncated context prompts + generates the statement/distractor pairs per task type across all 5 formats simultaneously. Needs a GPU (LLaMA-3.1-8B-Instruct generation), submitted via `run_eval.sh`.
 
 ### `run_eval_inference.py` / `submit_eval_inference.sh`
 
