@@ -28,6 +28,7 @@ Usage (login node, no GPU):
 """
 
 import os
+import re
 import glob
 import json
 import struct
@@ -66,13 +67,27 @@ def bin_fallback(bin_path, dtype):
     return os.path.getsize(bin_path) // np.dtype(dtype).itemsize
 
 
-def stats_for_format(root, fmt):
+def shard_index(idx_path):
+    """Parse the chunk number from train_<NNNNN>_tokens.idx; None if no match."""
+    m = re.search(r"train_(\d+)_tokens\.idx$", os.path.basename(idx_path))
+    return int(m.group(1)) if m else None
+
+
+def stats_for_format(root, fmt, min_shard, max_shard):
     fmt_dir = os.path.join(root, fmt)
     idx_files = sorted(glob.glob(os.path.join(fmt_dir, "*.idx")))
     if not idx_files:
         # some layouts nest one level deeper
         idx_files = sorted(glob.glob(os.path.join(fmt_dir, "**", "*.idx"),
                                      recursive=True))
+    # Count ONLY the shards training actually loads (chunks min_shard..max_shard).
+    # The tokenized dir may hold extra chunks (e.g. 24-27) that training never sees.
+    kept = []
+    for idx in idx_files:
+        si = shard_index(idx)
+        if si is not None and min_shard <= si <= max_shard:
+            kept.append(idx)
+    idx_files = kept
     total_tokens = 0
     total_segments = 0
     shards = []
@@ -107,14 +122,20 @@ def main():
         help="Dir containing one subfolder per format with .bin/.idx shards.",
     )
     ap.add_argument("--out", default="token_stats.json")
+    ap.add_argument("--min-shard", type=int, default=0,
+                    help="First training chunk to count (default 0).")
+    ap.add_argument("--max-shard", type=int, default=23,
+                    help="Last training chunk to count, inclusive (default 23 — "
+                         "matches the 0..23 range submit_tabular_ablation.sh loads).")
     args = ap.parse_args()
 
     results = {}
     print("=" * 78)
+    print(f"Counting chunks {args.min_shard}..{args.max_shard} (what training loads)")
     print(f"{'format':<12}{'shards':>8}{'segments':>14}{'tokens':>18}{'tok/seg':>10}")
     print("-" * 78)
     for fmt in FORMATS:
-        s = stats_for_format(args.tokenized_root, fmt)
+        s = stats_for_format(args.tokenized_root, fmt, args.min_shard, args.max_shard)
         results[fmt] = s
         tps = (s["total_tokens"] / s["total_segments"]) if s["total_segments"] else 0
         print(f"{fmt:<12}{s['n_shards']:>8}{s['total_segments']:>14,}"

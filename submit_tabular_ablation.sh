@@ -1,5 +1,6 @@
 #!/bin/bash
-# Train a 1.54B proxy model on one serialization format, then auto-submit eval.
+# Train a 1.54B proxy model on one serialization format. Eval is run manually
+# afterward (see submit_eval_inference.sh) — not auto-submitted from here.
 #
 # Usage:
 #   sbatch submit_tabular_ablation.sh csv
@@ -9,8 +10,17 @@
 #   sbatch submit_tabular_ablation.sh sql_schema
 #
 # Submit all 5 at once — they run in parallel on separate node allocations.
+#
+# RESUME a wall-stopped run (continue from an existing checkpoint):
+#   RESUME_TRAINING=true sbatch submit_tabular_ablation.sh <fmt> <seed> <old_ckpt_dir>
+#
+# OPTIONAL env overrides:
+#   CHECKPOINT_STEPS=1000   save less often (default 500) — fewer/larger gaps, less disk
+#   OUTPUT_BASE=/path       write checkpoints+logs here instead of the store
+#                           (e.g. /capstor/scratch/cscs/djanjetovic/meg-runs)
+#   STAGE_OUT=false         skip copying the finished run to the permanent store
 
-#SBATCH --account=a139
+#SBATCH --account=infra01
 #SBATCH --time=12:00:00
 #SBATCH --job-name=tabular-ablation
 #SBATCH --output=/iopsstor/scratch/cscs/djanjetovic/swiss-megatron/logs/slurm/training/%x-%j.out
@@ -25,6 +35,9 @@ echo "START TIME: $(date)"
 # ── Format ─────────────────────────────────────────────────────────────────────
 
 FORMAT_NAME=${1:-csv}
+SEED=${2:-42}
+LOAD_CKPT_OVERRIDE=${3:-}
+
 
 if [[ ! "$FORMAT_NAME" =~ ^(csv|sql_schema|keyvalue|markdown|json)$ ]]; then
     echo "ERROR: Unknown format '$FORMAT_NAME'. Valid: csv sql_schema keyvalue markdown json"
@@ -32,10 +45,11 @@ if [[ ! "$FORMAT_NAME" =~ ^(csv|sql_schema|keyvalue|markdown|json)$ ]]; then
 fi
 
 echo "Format: $FORMAT_NAME"
+echo "Seed: $SEED"
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
-MEGATRON_LM_DIR=/iopsstor/scratch/cscs/djanjetovic/swiss-megatron-new
+MEGATRON_LM_DIR=/capstor/store/cscs/swissai/a139/djanjetovic/swiss-megatron-fork
 ABLATION_DIR=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation
 DATASET_CACHE_DIR=/iopsstor/scratch/cscs/djanjetovic/datasets/cache
 CONTAINER_ENV=$ABLATION_DIR/tabular_container.toml
@@ -71,18 +85,20 @@ echo "Found $((${#DATA_PATH_LIST[@]} / 2)) valid shards."
 MBS=2
 GBS=256
 SEQ_LEN=4096
-CHECKPOINT_STEPS=500        # checkpoint every 500 steps in case of preemption
+CHECKPOINT_STEPS=${CHECKPOINT_STEPS:-500}        # checkpoint every N steps (override via env)
 TARGET_TOKENS=30000000000
 TRAINING_STEPS=$((TARGET_TOKENS / (GBS * SEQ_LEN)))
-RESUME_TRAINING=false
+RESUME_TRAINING=${RESUME_TRAINING:-false}
 
 # ── Experiment directories ─────────────────────────────────────────────────────
 
 PROJECT_NAME=tabular-ablation
 # Use SLURM_JOB_ID in the WandB name so this creates a new run,
 # not appending to the deleted previous run.
-EXP_NAME=tabular-$FORMAT_NAME-1p5b-$SLURM_JOB_ID
-PROJECT_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs/$PROJECT_NAME
+EXP_NAME=tabular-$FORMAT_NAME-1p5b-seed$SEED-$SLURM_JOB_ID
+# OUTPUT_BASE lets you redirect checkpoints+logs off the store (e.g. to scratch)
+# without moving the Megatron code. Defaults to the original store location.
+PROJECT_DIR=${OUTPUT_BASE:-$MEGATRON_LM_DIR/logs/Meg-Runs}/$PROJECT_NAME
 EXP_DIR=$PROJECT_DIR/$EXP_NAME
 CKPT_DIR=$EXP_DIR/checkpoints
 LOGGING_DIR=$EXP_DIR/logging
@@ -156,7 +172,7 @@ TRAINING_ARGS=(
 )
 
 INITIALIZATION_ARGS=(
-    --seed 42
+    --seed $SEED
     --init-method-std 0.008944
 )
 
@@ -168,10 +184,10 @@ LEARNING_RATE_ARGS=(
 )
 
 if [ "$RESUME_TRAINING" = true ]; then
-    echo "RESUME MODE: loading from $CKPT_DIR"
-    LOAD_DIR=$CKPT_DIR
+    LOAD_DIR=${LOAD_CKPT_OVERRIDE:-$CKPT_DIR}
+    echo "RESUME MODE: loading from $LOAD_DIR"
 else
-    echo "FRESH START: training from scratch (seed 42)"
+    echo "FRESH START: training from scratch (seed $SEED)"
     LOAD_DIR=""
 fi
 
@@ -251,28 +267,28 @@ srun \
 TRAIN_EXIT=$?
 echo "Training finished with exit code $TRAIN_EXIT"
 
-# ── Auto-submit eval ───────────────────────────────────────────────────────────
-# Submit the eval job immediately after training, passing the checkpoint path
-# so it knows exactly where the weights are. No need for permanent storage —
-# eval will start within minutes of training finishing.
+# ── Post-training: stage-out, then eval reminder ──────────────────────────────
+# Eval is intentionally NOT auto-submitted — see the "Eval is run manually"
+# block below for how to trigger it once you're ready.
+# Stage-out is skipped when STAGE_OUT=false (e.g. when checkpoints were written to
+# scratch via OUTPUT_BASE and you don't want to copy them back into the store).
 
-if [ $TRAIN_EXIT -eq 0 ]; then
-    echo "Submitting eval job for $FORMAT_NAME ..."
-    sbatch $ABLATION_DIR/submit_eval_inference.sh $FORMAT_NAME $CKPT_DIR
-    echo "Eval job submitted."
-
+if [ "${STAGE_OUT:-true}" = "true" ] && { [ $TRAIN_EXIT -eq 0 ] || [ $TRAIN_EXIT -eq 143 ]; }; then
     # ── Stage-out checkpoints + logs to permanent store ─────────────────────────
-    # Training wrote checkpoints to scratch (fast, frequent writes). Now copy the
-    # whole experiment dir (checkpoints + logging + tensorboard) to backed-up
-    # store so it survives the 14-day scratch cleanup and stays available for
-    # later analysis and re-evaluation. This runs on the dedicated xfer partition.
     STORE_CKPT_DEST=$STORE_DIR/checkpoints/$EXP_NAME
     echo "Submitting stage-out: $EXP_DIR -> $STORE_CKPT_DEST"
-    sbatch --job-name=stage_out_$FORMAT_NAME \
+    sbatch --account=infra01 --job-name=stage_out_$FORMAT_NAME \
         $ABLATION_DIR/stage.sbatch "$EXP_DIR" "$STORE_CKPT_DEST"
     echo "Stage-out job submitted."
+
+    # ── Eval is run manually ─────────────────────────────────────────────────────
+    # Eval is no longer auto-submitted here. Run it manually once you are ready:
+    #   EVAL_ENABLED=1 sbatch submit_eval_inference.sh <format> <ckpt_dir> <seed>
+    echo "Training complete. Run eval manually when ready (see submit_eval_inference.sh)."
+elif [ "${STAGE_OUT:-true}" != "true" ]; then
+    echo "STAGE_OUT=false — checkpoints left in $CKPT_DIR (no copy to store)."
 else
-    echo "Training failed — not submitting eval or stage-out."
+    echo "Training failed — not submitting stage-out."
 fi
 
 echo "END TIME: $(date)"

@@ -39,6 +39,10 @@ from collections import defaultdict
 _p = argparse.ArgumentParser(add_help=False)
 _p.add_argument('--format', required=True,
                 choices=['csv', 'json', 'keyvalue', 'markdown', 'sql_schema'])
+_p.add_argument('--run-id', default=None,
+                help='Unique identifier for this run used in output filenames '
+                     '(e.g. "csv_seed42" or "tabular-csv-1p5b-2561889"). '
+                     'Defaults to --format when not given (backwards-compatible).')
 _p.add_argument('--ckpt-dir', default='dummy',
                 help='Path to checkpoint directory. Ignored in --smoke-test mode.')
 _p.add_argument('--pairs-dir', required=True,
@@ -55,9 +59,15 @@ eval_args, _ = _p.parse_known_args()
 MEGATRON_DIR   = os.environ.get('MEGATRON_LM_DIR',
                      '/iopsstor/scratch/cscs/djanjetovic/swiss-megatron')
 TOKENIZER_PATH = '/iopsstor/scratch/cscs/djanjetovic/tokenizer_cache/apertus'
-PAIRS_PATH     = os.path.join(eval_args.pairs_dir, f'pairs_{eval_args.format}.jsonl')
-RESULTS_PATH   = os.path.join(eval_args.output_dir, f'results_{eval_args.format}.jsonl')
-SUMMARY_PATH   = os.path.join(eval_args.output_dir, f'summary_{eval_args.format}.json')
+
+# RUN_ID scopes all output files so runs with different seeds never overwrite
+# each other. Falls back to format name if --run-id wasn't given (e.g. old
+# single-seed runs that predate this change).
+RUN_ID     = eval_args.run_id if eval_args.run_id else eval_args.format
+
+PAIRS_PATH   = os.path.join(eval_args.pairs_dir,  f'pairs_{eval_args.format}.jsonl')
+RESULTS_PATH = os.path.join(eval_args.output_dir, f'results_{RUN_ID}.jsonl')
+SUMMARY_PATH = os.path.join(eval_args.output_dir, f'summary_{RUN_ID}.json')
 
 os.makedirs(eval_args.output_dir, exist_ok=True)
 
@@ -69,7 +79,7 @@ logging.basicConfig(
     handlers=[
         logging.StreamHandler(sys.stdout),
         logging.FileHandler(
-            os.path.join(eval_args.output_dir, f'eval_{eval_args.format}.log')
+            os.path.join(eval_args.output_dir, f'eval_{RUN_ID}.log')
         ),
     ],
 )
@@ -184,7 +194,7 @@ is_io_rank  = (global_rank == 0)
 # Mirrors what pretrain_gpt.py does. If this fails, check what model_provider
 # looks like in your swiss-megatron/pretrain_gpt.py and replicate it here.
 
-def model_provider(pre_process=True, post_process=True):
+def model_provider(pre_process=True, post_process=True, **kwargs):
     from megatron.training.arguments import core_transformer_config_from_args
     from megatron.core.models.gpt import GPTModel
 
@@ -215,7 +225,7 @@ def model_provider(pre_process=True, post_process=True):
         pre_process=pre_process,
         post_process=post_process,
         fp16_lm_cross_entropy=getattr(args, 'fp16_lm_cross_entropy', False),
-        parallel_output=True,
+        parallel_output=False,
         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
         position_embedding_type=args.position_embedding_type,
         rotary_percent=getattr(args, 'rotary_percent', 1.0),
@@ -252,17 +262,25 @@ def score_hypothesis(table_text: str, hypothesis: str) -> float | None:
     Lower = model assigns higher probability to this hypothesis.
     Returns None if the combined sequence exceeds max_seq_len.
     """
-    # Tokenize prefix and full sequence to find the boundary
+    # Tokenize prefix and hypothesis separately so we can truncate if needed
     prefix_ids = tokenizer.tokenize(table_text)
-    full_ids   = tokenizer.tokenize(table_text + '\n' + hypothesis)
+    hyp_ids    = tokenizer.tokenize('\n' + hypothesis)
 
-    if len(full_ids) > eval_args.max_seq_len:
-        return None
-
-    n_hyp = len(full_ids) - len(prefix_ids)
-    if n_hyp <= 0:
+    # If hypothesis alone exceeds context, skip (nothing we can do)
+    if len(hyp_ids) <= 0:
         log.warning('No hypothesis tokens after tokenization — skipping.')
         return None
+    if len(hyp_ids) >= eval_args.max_seq_len:
+        log.warning('Hypothesis alone exceeds max_seq_len — skipping.')
+        return None
+
+    # Truncate table prefix from the end to fit within context window
+    max_prefix = eval_args.max_seq_len - len(hyp_ids)
+    if len(prefix_ids) > max_prefix:
+        prefix_ids = prefix_ids[:max_prefix]
+
+    full_ids = prefix_ids + hyp_ids
+    n_hyp = len(hyp_ids)
 
     device = torch.cuda.current_device()
 
@@ -282,6 +300,8 @@ def score_hypothesis(table_text: str, hypothesis: str) -> float | None:
         reset_position_ids=False,
         reset_attention_mask=False,
         eod_mask_loss=False,
+        pad_token=tokenizer.eod,
+        pad_mask_loss=False,
     )
 
     with torch.no_grad():
@@ -333,7 +353,23 @@ results_file = open(RESULTS_PATH, 'a') if is_io_rank else None
 
 correct_by_type: dict[str, list[bool]] = defaultdict(list)
 correct_overall: list[bool] = []
-skipped  = 0
+
+# FEEDBACK: "evaluation per tables not tokens"
+# Track correctness at the table level, not just the pair level.
+# For each table_id, record which of its pairs the model got right.
+# This lets us report what fraction of TABLES the model understood,
+# rather than what fraction of individual pairs it got right.
+# These two numbers can diverge: a model might be right on 80% of pairs
+# but only "fully understand" 30% of tables (if errors cluster per table).
+correct_by_table: dict[str, list[bool]] = defaultdict(list)
+
+# Track whether each pair's answer was in context (from prepare_eval_data_v2.py).
+# Allows reporting accuracy split by answer_in_context = True/False.
+answer_in_context_flags: list[bool] = []
+correct_when_in_context: list[bool] = []
+correct_when_not_in_context: list[bool] = []
+
+skipped   = 0
 processed = 0
 start_time = time.time()
 
@@ -369,6 +405,17 @@ for i, record in enumerate(records):
     is_correct = nll_s < nll_d
     correct_by_type[pair_type].append(is_correct)
     correct_overall.append(is_correct)
+    correct_by_table[table_id].append(is_correct)
+
+    # Track answer_in_context if the field exists (pairs generated after the
+    # prepare_eval_data_v2.py update will have it; older pairs will not).
+    in_ctx = record.get('answer_in_context', None)
+    if in_ctx is not None:
+        answer_in_context_flags.append(in_ctx)
+        if in_ctx:
+            correct_when_in_context.append(is_correct)
+        else:
+            correct_when_not_in_context.append(is_correct)
 
     if is_io_rank:
         result = {
@@ -399,15 +446,53 @@ if is_io_rank:
         for t, v in correct_by_type.items()
     }
 
+    # FEEDBACK: "evaluation per tables not tokens"
+    # Per-table accuracy: for each table, did the model get ALL pairs right?
+    # Majority right? This is stricter than per-pair accuracy and more meaningful:
+    # if a model consistently fails on the same tables, per-pair accuracy hides it.
+    n_tables = len(correct_by_table)
+    n_tables_all_correct = sum(1 for v in correct_by_table.values() if all(v))
+    n_tables_majority_correct = sum(
+        1 for v in correct_by_table.values() if sum(v) > len(v) / 2
+    )
+    per_table_acc_all      = round(n_tables_all_correct / n_tables, 4) if n_tables else 0.0
+    per_table_acc_majority = round(n_tables_majority_correct / n_tables, 4) if n_tables else 0.0
+
+    # Answer-in-context split: accuracy on pairs where the answer was visible
+    # in the serialized context vs. pairs where it was truncated away.
+    acc_in_ctx = (
+        round(sum(correct_when_in_context) / len(correct_when_in_context), 4)
+        if correct_when_in_context else None
+    )
+    acc_not_in_ctx = (
+        round(sum(correct_when_not_in_context) / len(correct_when_not_in_context), 4)
+        if correct_when_not_in_context else None
+    )
+
     summary = {
-        'format':             eval_args.format,
-        'ckpt_dir':           eval_args.ckpt_dir,
-        'n_pairs':            len(records),
-        'n_processed':        processed,
-        'n_skipped':          skipped,
-        'overall_accuracy':   round(overall_acc, 4),
-        'by_type':            type_acc,
-        'total_time_min':     round(total_time, 2),
+        'format':              eval_args.format,
+        'run_id':              RUN_ID,
+        'ckpt_dir':            eval_args.ckpt_dir,
+        'n_pairs':             len(records),
+        'n_processed':         processed,
+        'n_skipped':           skipped,
+        'overall_accuracy':    round(overall_acc, 4),
+        'by_type':             type_acc,
+        # Per-table stats (feedback: "evaluation per tables not tokens")
+        'per_table': {
+            'n_tables':        n_tables,
+            'all_pairs_correct':   {'n': n_tables_all_correct,      'accuracy': per_table_acc_all},
+            'majority_correct':    {'n': n_tables_majority_correct, 'accuracy': per_table_acc_majority},
+        },
+        # Answer-in-context split (feedback: "how often does the true answer appear?")
+        'answer_in_context': {
+            'n_pairs_tracked':           len(answer_in_context_flags),
+            'n_in_context':              len(correct_when_in_context),
+            'n_not_in_context':          len(correct_when_not_in_context),
+            'accuracy_in_context':       acc_in_ctx,
+            'accuracy_not_in_context':   acc_not_in_ctx,
+        },
+        'total_time_min':      round(total_time, 2),
     }
 
     with open(SUMMARY_PATH, 'w') as f:
@@ -415,11 +500,16 @@ if is_io_rank:
 
     log.info('=' * 60)
     log.info(f'Done. processed={processed} skipped={skipped} time={total_time:.1f}min')
-    log.info(f'Overall accuracy: {overall_acc:.4f} ({sum(correct_overall)}/{len(correct_overall)})')
+    log.info(f'Overall accuracy (per pair):      {overall_acc:.4f} ({sum(correct_overall)}/{len(correct_overall)})')
+    log.info(f'Per-table (all correct):          {per_table_acc_all:.4f} ({n_tables_all_correct}/{n_tables} tables)')
+    log.info(f'Per-table (majority correct):     {per_table_acc_majority:.4f} ({n_tables_majority_correct}/{n_tables} tables)')
+    if acc_in_ctx is not None:
+        log.info(f'Accuracy when answer in context:  {acc_in_ctx:.4f} (n={len(correct_when_in_context)})')
+        log.info(f'Accuracy when answer NOT in ctx:  {acc_not_in_ctx:.4f} (n={len(correct_when_not_in_context)})')
     for t, v in type_acc.items():
         log.info(f'  {t:15s}: {v["accuracy"]:.4f}  ({v["correct"]}/{v["total"]})')
-    log.info(f'Results  → {RESULTS_PATH}')
-    log.info(f'Summary  → {SUMMARY_PATH}')
+    log.info(f'Results  -> {RESULTS_PATH}')
+    log.info(f'Summary  -> {SUMMARY_PATH}')
     log.info('=' * 60)
 
 torch.distributed.barrier()

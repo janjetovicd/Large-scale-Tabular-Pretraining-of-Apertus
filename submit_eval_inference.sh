@@ -9,7 +9,7 @@
 #   $1 = format (csv | json | keyvalue | markdown | sql_schema)
 #   $2 = checkpoint directory (the EXP_DIR/checkpoints path from training)
 
-#SBATCH --account=a139
+#SBATCH --account=infra01
 #SBATCH --partition=normal
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=2
@@ -23,10 +23,21 @@
 echo "START TIME: $(date)"
 echo "Running on: $(hostname)"
 
+# ── Guard: prevent accidental auto-eval ────────────────────────────────────────
+# Eval is intentionally not auto-submitted from training. To run eval manually:
+#   EVAL_ENABLED=1 sbatch submit_eval_inference.sh <format> <ckpt_dir> <seed>
+# Without EVAL_ENABLED=1 the script exits immediately (safe no-op).
+if [ "${EVAL_ENABLED:-0}" != "1" ]; then
+    echo "EVAL_ENABLED is not set — eval skipped."
+    echo "To run eval: EVAL_ENABLED=1 sbatch submit_eval_inference.sh <format> <ckpt_dir> <seed>"
+    exit 0
+fi
+
 # ── Args ───────────────────────────────────────────────────────────────────────
 
 FORMAT=${1:-csv}
 CKPT_DIR=${2:-}
+SEED=${3:-}        # optional; when provided, used to name output files
 
 if [[ ! "$FORMAT" =~ ^(csv|json|keyvalue|markdown|sql_schema)$ ]]; then
     echo "ERROR: Unknown format '$FORMAT'. Valid: csv json keyvalue markdown sql_schema"
@@ -43,12 +54,28 @@ if [ ! -d "$CKPT_DIR" ]; then
     exit 1
 fi
 
+# Build a unique run ID so each seed writes to its own output files and nothing
+# overwrites anything else.
+# - If a seed was passed explicitly (e.g. from an updated submit_tabular_ablation.sh),
+#   use "<format>_seed<seed>" — clean and human-readable.
+# - If no seed was given (the 10 jobs already submitted before this update use the
+#   old call signature), fall back to the experiment name embedded in the checkpoint
+#   path. That path looks like: .../tabular-csv-1p5b-<jobid>/checkpoints
+#   so basename of its parent gives a unique ID like "tabular-csv-1p5b-2561889".
+if [ -n "$SEED" ]; then
+    RUN_ID="${FORMAT}_seed${SEED}"
+else
+    EXP_NAME=$(basename "$(dirname "$CKPT_DIR")")
+    RUN_ID="$EXP_NAME"
+fi
+
 echo "Format:     $FORMAT"
 echo "Checkpoint: $CKPT_DIR"
+echo "Run ID:     $RUN_ID"
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
-MEGATRON_LM_DIR=/iopsstor/scratch/cscs/djanjetovic/swiss-megatron-new
+MEGATRON_LM_DIR=/capstor/store/cscs/swissai/a139/djanjetovic/swiss-megatron-fork
 ABLATION_DIR=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation
 CONTAINER_ENV=$ABLATION_DIR/tabular_container.toml
 
@@ -88,6 +115,7 @@ export WORLD_SIZE=$SLURM_NPROCS
 
 EVAL_CMD="python3 $ABLATION_DIR/run_eval_inference.py \
     --format     $FORMAT \
+    --run-id     $RUN_ID \
     --ckpt-dir   $CKPT_DIR \
     --pairs-dir  $PAIRS_DIR \
     --output-dir $OUTPUT_DIR \

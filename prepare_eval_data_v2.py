@@ -319,6 +319,77 @@ def truncate_to_budget(
             hi = mid - 1
     return df.iloc[:best_n]
 
+
+def get_relevant_columns(df: pd.DataFrame, statement: str, distractor: str) -> list:
+    """
+    Return the subset of df columns whose names appear in the statement or distractor.
+    Falls back to all columns if nothing matches.
+
+    WHY (feedback: "remove noise from the table data not used by the two statements"):
+    The full table often has many columns irrelevant to the specific pair being tested.
+    For example, if the statement is about "revenue", feeding the model columns for
+    "employees", "founded", etc. is noise that makes it harder to isolate whether
+    the model actually read the right cell. This filters to only what matters.
+    """
+    import re
+    text = (statement + " " + distractor).lower()
+    relevant = [col for col in df.columns
+                if re.search(r'\b' + re.escape(col.lower()) + r'\b', text)]
+    return relevant if relevant else list(df.columns)
+
+
+def answer_in_context(table_serialized: str, statement: str) -> bool:
+    """
+    Rough heuristic: check whether non-trivial content words from the statement
+    appear in the serialized table text.
+
+    WHY (feedback: "how often does the true answer appear in this context?"):
+    After truncation, the row containing the answer might have been cut off.
+    Storing this flag lets you filter pairs post-hoc to only those where the
+    answer was actually visible in context, giving a cleaner accuracy number.
+    Without this flag you cannot distinguish "model got it wrong" from
+    "answer was not even in the context window".
+    """
+    import re
+    STOPWORDS = {
+        'the', 'a', 'an', 'is', 'are', 'was', 'were', 'of', 'in', 'at', 'to',
+        'for', 'with', 'and', 'or', 'that', 'it', 'has', 'have', 'had', 'be',
+        'been', 'by', 'from', 'on', 'not', 'as', 'its', 'this', 'their',
+    }
+    words = {w for w in re.findall(r'\b\w+\b', statement.lower())
+             if len(w) > 2} - STOPWORDS
+    table_lower = table_serialized.lower()
+    return any(w in table_lower for w in words)
+
+
+def serialize_single_format(
+    fmt: str,
+    df: pd.DataFrame,
+    schema,
+    tokenizer,
+    budget: int = TOKEN_BUDGET,
+) -> str | None:
+    """
+    Serialize df in one specific format, fitting within the token budget.
+    Used when serializing per-pair column-filtered dataframes.
+    """
+    serializers = {
+        "csv":      serialize_csv,
+        "keyvalue": serialize_keyvalue,
+        "markdown": serialize_markdown,
+        "json":     serialize_json_records,
+    }
+    if fmt == "sql_schema":
+        if schema is None:
+            fn = serialize_csv
+        else:
+            fn = lambda sub: serialize_sql_schema(sub, schema)
+    else:
+        fn = serializers.get(fmt)
+        if fn is None:
+            return None
+    return _fit_rows(fn, df, tokenizer, budget)
+
 # ── LLaMA generation ──────────────────────────────────────────────────────────
 
 def generate_pairs_for_table(
@@ -560,24 +631,29 @@ def main():
             else:
                 log.info(f"[{i+1}/{len(selected)}] {table_id} | rows={len(df)} cols={len(df.columns)}")
 
-            # ── Serialization ─────────────────────────────────────────────────
-            log.info(f"  Serializing {len(df)} rows in {len(FORMATS)} formats...")
-            t_ser = time.time()
-            serialized = serialize_table_all_formats(df, schema, tokenizer)
-            log.info(f"  Serialization done in {time.time()-t_ser:.2f}s")
+            # ── Step 1: Truncate table first ──────────────────────────────────
+            # FEEDBACK: "cut the table first and then prepare evaluation set"
+            # OLD order: serialize full table -> generate pairs -> truncate at
+            # inference. Problem: pairs could reference rows that fit in markdown
+            # (used for generation) but not in a tighter format like sql_schema.
+            # NEW order: find how many rows fit across ALL formats, trim to that,
+            # THEN generate. Every pair now only references rows visible in every
+            # serialization format.
+            t_trunc = time.time()
+            min_rows = len(df)
+            for fmt in FORMATS:
+                df_fmt = truncate_to_budget(df, fmt, schema, tokenizer)
+                min_rows = min(min_rows, len(df_fmt))
+            df_trunc = df.iloc[:max(min_rows, 1)]
+            log.info(
+                f"  Truncated {len(df)} -> {len(df_trunc)} rows "
+                f"(min across all formats) in {time.time()-t_trunc:.2f}s"
+            )
 
-            missing_fmts = [fmt for fmt, v in serialized.items() if v is None]
-            if missing_fmts:
-                log.warning(f"  Skipping {table_id}: serialization failed for {missing_fmts}")
-                save_checkpoint(table_id)
-                completed.add(table_id)
-                failed += 1
-                continue
-
-            # ── Generation ────────────────────────────────────────────────────
-            log.info(f"  Calling LLaMA generation...")
+            # ── Step 2: Generate pairs from the truncated table ───────────────
+            log.info(f"  Calling LLaMA generation on truncated table ({len(df_trunc)} rows)...")
             t_gen_total = time.time()
-            pairs = generate_pairs_for_table(df, table_id, tokenizer=tokenizer, pipe=pipe)
+            pairs = generate_pairs_for_table(df_trunc, table_id, tokenizer=tokenizer, pipe=pipe)
             log.info(f"  Total generation time: {time.time()-t_gen_total:.1f}s | pairs={len(pairs)}")
 
             if not pairs:
@@ -587,15 +663,29 @@ def main():
                 failed += 1
                 continue
 
-            # ── Write ─────────────────────────────────────────────────────────
+            # ── Step 3: Per-pair column filtering + serialize + write ─────────
+            # FEEDBACK: "remove noise from the table data not used by the two statements"
+            # Filter df_trunc to only the columns named in the statement/distractor
+            # before serializing. Each pair gets its own minimal table context.
+            #
+            # FEEDBACK: "how often does the true answer appear in this context?"
+            # After serializing, check whether the answer is actually visible.
+            # Stored as answer_in_context (bool) so you can filter post-hoc.
             for fmt in FORMATS:
                 for pair in pairs:
+                    rel_cols = get_relevant_columns(
+                        df_trunc, pair["statement"], pair["distractor"]
+                    )
+                    df_pair = df_trunc[rel_cols]
+                    pair_serialized = serialize_single_format(fmt, df_pair, schema, tokenizer)
+                    in_ctx = answer_in_context(pair_serialized or "", pair["statement"])
                     pair_files[fmt].write(json.dumps({
-                        "table_id":         table_id,
-                        "statement":        pair["statement"],
-                        "distractor":       pair["distractor"],
-                        "type":             pair["type"],
-                        "table_serialized": serialized[fmt],
+                        "table_id":          table_id,
+                        "statement":         pair["statement"],
+                        "distractor":        pair["distractor"],
+                        "type":              pair["type"],
+                        "table_serialized":  pair_serialized,
+                        "answer_in_context": in_ctx,
                     }, ensure_ascii=False) + "\n")
                 pair_files[fmt].flush()
 
@@ -609,7 +699,7 @@ def main():
             gt_file.flush()
 
             with open(os.path.join(df_dir, f"{table_id}.pkl"), "wb") as pf:
-                pickle.dump(df, pf)
+                pickle.dump(df_trunc, pf)  # save the truncated df, not the full one
 
             save_checkpoint(table_id)
             completed.add(table_id)
