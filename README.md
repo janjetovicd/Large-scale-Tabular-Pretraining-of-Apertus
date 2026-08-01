@@ -10,6 +10,8 @@ Serialization format ablation study for large-scale tabular posttraining. Part o
 
 **Formats under test:** `csv`, `keyvalue`, `markdown`, `json`, `sql_schema`
 
+**Next steps:** Expanding the corpus (the last section below)
+
 ---
 
 ## Repository layout
@@ -182,3 +184,13 @@ Equalizes the 5 formats at the same number of **rows seen** rather than the same
 ## Data
 
 **Source:** [mlfoundations/t4](https://huggingface.co/datasets/mlfoundations/t4) — a large-scale collection of tables scraped from the web, stored as parquet files organized in 76 chunks. Chunks 0–23 used for training; chunks 24–25 held out for evaluation.
+
+---
+ 
+## Expanding the corpus — candidate datasets
+ 
+The ablation settles the serialization format (CSV); the next step is to grow the tabular mixture beyond T4 (~100B tokens) toward the ~300B-token posttraining target. The **dataset-discovery sheet** tracks vetted candidate datasets that can be fed straight through this repo's pipeline — `serialize_t4.py --format {csv,json,keyvalue,markdown,sql_schema}` → `submit_tokenize.sh` → Megatron `.bin`/`.idx`, the same path used for T4. Each entry is scored on scale, column interpretability, licensing, domain value, and processing status.
+ 
+**Full sheet:** [Candidate tabular datasets (Google Sheet)](https://docs.google.com/spreadsheets/d/1dhU5YTFFvMc7F_4tkxH4bkfuS2y5Z6hVnONjzbwiqos/edit?usp=sharing)
+
+> ⚠ **Licensing / access before training:** Criteo is non-commercial; MIMIC-III and eICU require PhysioNet credentialing (CITI training). Verify terms per dataset before ingesting — status and rationale are tracked in the sheet.
