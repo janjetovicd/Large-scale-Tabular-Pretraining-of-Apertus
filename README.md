@@ -1,10 +1,14 @@
 # Tabular Ablation Study
 
-Serialization format ablation study for large-scale tabular posttraining. Part of a semester project at EPFL / CSCS, supervised by Prof. Antoine Bosselut.
+Serialization format ablation study for large-scale tabular pretraining. Part of a semester project at EPFL / CSCS, supervised by Prof. Antoine Bosselut.
 
-**Report:** [Tabular Datasets for the Posttraining Pipeline of Apertus](report/Semester_Project_Report_Dijana_Janjetovic_updated.pdf)
+**Report:** [Tabular Datasets for the Pretraining Pipeline of Apertus](report/Semester_Project_Report_Dijana_Janjetovic_updated.pdf)
 
-**Goal:** Train 5 small proxy models (1.54B parameters, ~30B tokens per run, 2 random seeds each) on the [T4 dataset](https://huggingface.co/datasets/mlfoundations/t4), one per serialization format, and evaluate which format leads to the best downstream tabular understanding — informing the format choice for the Apertus posttraining mixture (tabular data added on top of an already-trained Apertus).
+**Presented:** spotlight talk and poster, *More Table per Token: Format Markup Does Not Pay Off in LLM Pretraining*, [Stanford Data-Centric AI Workshop](https://snap.stanford.edu/graphlearning-workshop-2026/), November 2026.
+
+**Result in brief:** compared at matched rows seen and averaged over two seeds, the leading formats (CSV, JSON, SQL schema, Markdown) are statistically indistinguishable in accuracy, while CSV fits roughly 2x more rows per token. An initial single-seed CSV/JSON advantage did not survive replication. The full T4 corpus has been serialized and tokenized in CSV for the Apertus data mixture.
+
+**Goal:** Train 5 small proxy models (1.54B parameters, ~30B tokens per run, 2 random seeds each) on the [T4 dataset](https://huggingface.co/datasets/mlfoundations/t4), one per serialization format, and evaluate which format leads to the best downstream tabular understanding — informing the format choice for the Apertus continued-pretraining mixture (tabular data added on top of an already-trained Apertus).
 
 **Comparison method:** formats are compared at matched **rows seen**, not matched tokens — token-efficient formats (CSV, SQL schema) pack ~2x more rows into the same token budget, so a fixed-token comparison would confound serialization quality with data quantity. See [`analysis/RUNBOOK.md`](analysis/RUNBOOK.md) for the full method and script order.
 
@@ -189,7 +193,7 @@ Equalizes the 5 formats at the same number of **rows seen** rather than the same
  
 ## Expanding the corpus — candidate datasets
  
-The ablation settles the serialization format (CSV); the next step is to grow the tabular mixture beyond T4 (~100B tokens) toward the ~300B-token posttraining target. The **dataset-discovery sheet** tracks vetted candidate datasets that can be fed straight through this repo's pipeline — `serialize_t4.py --format {csv,json,keyvalue,markdown,sql_schema}` → `submit_tokenize.sh` → Megatron `.bin`/`.idx`, the same path used for T4. Each entry is scored on scale, column interpretability, licensing, domain value, and processing status.
+The ablation settles the serialization format (CSV); the next step is to grow the tabular mixture beyond T4 (~100B tokens) toward the ~300B-token continued-pretraining target. The **dataset-discovery sheet** tracks vetted candidate datasets that can be fed straight through this repo's pipeline — `serialize_t4.py --format {csv,json,keyvalue,markdown,sql_schema}` → `submit_tokenize.sh` → Megatron `.bin`/`.idx`, the same path used for T4. Each entry is scored on scale, column interpretability, licensing, domain value, and processing status.
  
 **Full sheet:** [Candidate tabular datasets (Google Sheet)](https://docs.google.com/spreadsheets/d/1dhU5YTFFvMc7F_4tkxH4bkfuS2y5Z6hVnONjzbwiqos/edit?usp=sharing)
 
